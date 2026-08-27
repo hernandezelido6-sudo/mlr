@@ -1,0 +1,61 @@
+import { COOKIE_NAME, OAUTH_STATE_COOKIE, SESSION_TTL_MS, decodeOAuthState } from "@shared/const";
+import { parse as parseCookieHeader } from "cookie";
+import type { Express, Request, Response } from "express";
+import * as db from "../db";
+import { getSessionCookieOptions } from "./cookies";
+import { sdk } from "./sdk";
+
+function getQueryParam(req: Request, key: string): string | undefined {
+  const value = req.query[key];
+  return typeof value === "string" ? value : undefined;
+}
+
+export function registerOAuthRoutes(app: Express) {
+  app.get("/api/oauth/callback", async (req: Request, res: Response) => {
+    const code = getQueryParam(req, "code");
+    const state = getQueryParam(req, "state");
+
+    if (!code || !state) {
+      res.status(400).json({ error: "invalid authentication request" });
+      return;
+    }
+
+    const { nonce } = decodeOAuthState(state);
+    const expectedNonce = parseCookieHeader(req.headers.cookie ?? "")[OAUTH_STATE_COOKIE];
+    if (!nonce || !expectedNonce || nonce !== expectedNonce) {
+      res.status(403).json({ error: "invalid authentication state" });
+      return;
+    }
+    res.clearCookie(OAUTH_STATE_COOKIE, { path: "/", secure: true, sameSite: "lax" });
+
+    try {
+      const tokenResponse = await sdk.exchangeCodeForToken(code, state);
+      const userInfo = await sdk.getUserInfo(tokenResponse.accessToken);
+
+      if (!userInfo.openId) {
+        res.status(400).json({ error: "invalid authentication response" });
+        return;
+      }
+
+      await db.upsertUser({
+        openId: userInfo.openId,
+        name: userInfo.name || null,
+        email: userInfo.email ?? null,
+        loginMethod: userInfo.loginMethod ?? userInfo.platform ?? null,
+        lastSignedIn: new Date(),
+      });
+
+      const sessionToken = await sdk.createSessionToken(userInfo.openId, {
+        name: userInfo.name || "",
+        expiresInMs: SESSION_TTL_MS,
+      });
+
+      const cookieOptions = getSessionCookieOptions(req);
+      res.cookie(COOKIE_NAME, sessionToken, { ...cookieOptions, maxAge: SESSION_TTL_MS });
+      res.redirect(302, "/");
+    } catch {
+      console.error("[OAuth] Authentication callback failed");
+      res.status(500).json({ error: "authentication could not be completed" });
+    }
+  });
+}
